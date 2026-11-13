@@ -5,3 +5,9 @@ data/
 Rplots.pdf
 outputs/gbif_occurrences_makay_isalo.csv
 outputs/makay_isalo_comparison_results.rds
+
+# Posit Assistant local configuration
+.posit/
+
+# markdown drafts kept out of version control
+*.md
