@@ -1,0 +1,7 @@
+step,record_count,share_of_madagascar
+"GBIF download (Madagascar, PRESENT) - verified against GBIF API",3635415,1
+"Candidate records read from parquet bins (lon 44-45, lat -23..-21, with coordinates)",235989,0.06491390941611894
+Inside Isalo bounding box,68259,0.018776123221145316
+Inside Makay bounding box,8407,0.0023125282808152577
+Clipped to Isalo polygon (st_within),53115,0.014610436497621317
+Clipped to Makay polygon (st_within),7341,0.002019301785353254

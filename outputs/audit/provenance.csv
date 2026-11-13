@@ -1,0 +1,16 @@
+item,value
+GBIF download key,0000459-260720095953322
+GBIF DOI,10.15468/dl.ufwdju
+Created (UTC),2026-07-20T19:51:06Z
+Completed (UTC),2026-07-20T22:53:14Z
+Download format,SIMPLE_CSV (50 columns)
+Download predicate,occurrenceStatus = PRESENT AND country = MG
+Total records,3635415
+Distinct datasets,2006
+License,CC BY-NC 4.0
+WDPA release,WDPA_WDOECM_Jul2026 (extracted 2026-07-16)
+WDPA file,WDPA_Jul2026_MDG-shapefile.zip (File Geodatabase)
+WDPA MD5,d96a919e7ce1ed8389c9da863f692d8d
+Target sites (WDPAID/SITE_ID),Isalo = 2312; Makay = 555790177
+Legacy parquet,"16 columns; 70,239,134 phantom rows; 300,486 records missing"
+Corrected parquet,"50 columns; 3,635,415 records; no phantoms"

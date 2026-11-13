@@ -1,0 +1,336 @@
+---
+title: "Makay and Isalo: a synthetic GBIF comparison"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Setup
+
+We have downloaded the complete GBIF database from https://gbif.org, and 
+converted it to the parquet format to read only the partition of Madagascar
+that corresponds to our area of interest. We fetch the protected area polygons
+for Makay and Isalo from the World Database on Protected Areas (WDPA) using the
+ `wdpar` package. 
+
+```{r}
+library(arrow) # to read parquet
+library(tidyverse) # for data manipulation
+library(scales) # scale conversion
+library(sf) # vector spatial data
+library(tmap) # map visualization
+library(wdpar) # to fetch protected areas
+
+# define paths
+wdpa_dir <- ("data/raw/wdpa")
+parquet_dir <- ("data/parquet/gbif_madagascar")
+# keep consistent colors across document
+area_colors <- c(Makay = "#3b7a57", Isalo = "#c85c3e")
+
+# create folder if needed
+dir.create(wdpa_dir, recursive = TRUE, showWarnings = FALSE)
+# fetch WDPA
+madagascar_wdpa <- wdpa_fetch("MDG", wait = TRUE, download_dir = wdpa_dir)
+
+protected_areas <- madagascar_wdpa |>
+  rename(geometry = SHAPE) |>
+  st_as_sf(sf_column_name = "geometry") |>
+  st_make_valid() |>
+  mutate(
+    area = coalesce(NAME_ENG, NAME),
+    # Area using laborde
+    AREA_KM2 = as.numeric(st_area(st_transform(geometry, 29702))) / 1000000
+  ) |>
+  filter(str_detect(area, "Makay|Isalo")) |>
+  st_transform(4326) 
+
+# Define bounding boxes to read only gbif data within
+bbox_matrix <- t(vapply(
+  st_geometry(protected_areas),
+  \(geometry) unname(st_bbox(geometry)),
+  numeric(4)
+))
+
+colnames(bbox_matrix) <- c("xmin", "ymin", "xmax", "ymax")
+
+
+area_bboxes <- as_tibble(bbox_matrix) |>
+  mutate(
+    lon_bin_min = floor(xmin),
+    lon_bin_max = floor(xmax),
+    lat_bin_min = floor(ymin),
+    lat_bin_max = floor(ymax)
+  )
+
+lon_bins <- seq(min(area_bboxes$lon_bin_min), max(area_bboxes$lon_bin_max))
+lat_bins <- seq(min(area_bboxes$lat_bin_min), max(area_bboxes$lat_bin_max))
+
+# columns to keep from gbif
+required_columns <- c(
+  "decimalLongitude",
+  "decimalLatitude",
+  "species",
+  "scientificName",
+  "year",
+  "datasetName",
+  "datasetKey",
+  "institutionCode",
+  "publishingOrgKey",
+  "basisOfRecord",
+  "class",
+  "iucnRedListCategory",
+  "genus",
+  "family",
+  "coordinateUncertaintyInMeters",
+  "occurrenceStatus"
+)
+
+# compute total for Mada
+madagascar_total <- open_dataset(parquet_dir) |>
+  filter(is.na(occurrenceStatus) | occurrenceStatus == "PRESENT") |>
+  summarise(total_records = n()) |>
+  collect()
+
+candidate_occurrences <- open_dataset(parquet_dir) |>
+  select(any_of(c(required_columns, "lon_bin", "lat_bin"))) |>
+  filter(
+    lon_bin %in% lon_bins,
+    lat_bin %in% lat_bins,
+    !is.na(decimalLongitude),
+    !is.na(decimalLatitude),
+    is.na(occurrenceStatus) | occurrenceStatus == "PRESENT"
+  ) |>
+  collect()
+
+for (column_name in setdiff(required_columns, names(candidate_occurrences))) {
+  candidate_occurrences[[column_name]] <- NA
+}
+
+area_occurrences <- candidate_occurrences |>
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326, remove = FALSE) |>
+  st_join(protected_areas |> select(area), join = st_within, left = FALSE) |>
+  st_drop_geometry() |>
+  mutate(
+    species_label = coalesce(species, scientificName),
+    record_year = suppressWarnings(as.integer(year))
+  )
+
+area_summary <- protected_areas |>
+  st_drop_geometry() |>
+  left_join(
+    area_occurrences |>
+      summarise(
+        occurrence_count = n(),
+        species_count = n_distinct(species_label, na.rm = TRUE),
+        first_year = if (all(is.na(record_year))) NA_integer_ else min(record_year, na.rm = TRUE),
+        last_year = if (all(is.na(record_year))) NA_integer_ else max(record_year, na.rm = TRUE),
+        .by = area
+      ),
+    by = "area"
+  ) |>
+  mutate(
+    occurrence_count = coalesce(occurrence_count, 0L),
+    species_count = coalesce(species_count, 0L),
+    occurrence_density_per_100_km2 = occurrence_count / AREA_KM2 * 100,
+    species_density_per_100_km2 = species_count / AREA_KM2 * 100
+  )
+
+filtering_steps <- tibble(
+  step = c(
+    "Madagascar present records",
+    "Records inside the exact protected-area polygons"
+  ),
+  record_count = c(
+    madagascar_total$total_records[[1]],
+    nrow(area_occurrences)
+  )
+) |>
+  mutate(
+    share_of_madagascar = record_count / first(record_count)
+  )
+
+decade_counts <- area_occurrences |>
+  filter(!is.na(record_year), between(record_year, 1800, as.integer(format(Sys.Date(), "%Y")))) |>
+  mutate(decade = (record_year %/% 10) * 10) |>
+  summarise(occurrence_count = n(), .by = c(area, decade))
+
+class_comparison <- area_occurrences |>
+  distinct(area, class, species_label) |>
+  filter(!is.na(class), !is.na(species_label)) |>
+  count(area, class, name = "species_count")
+
+top_classes <- class_comparison |>
+  summarise(total_species = sum(species_count), .by = class) |>
+  slice_max(total_species, n = 12, with_ties = FALSE) |>
+  arrange(total_species) |>
+  pull(class)
+
+class_plot_data <- class_comparison |>
+  filter(class %in% top_classes) |>
+  complete(area, class = top_classes, fill = list(species_count = 0)) |>
+  mutate(class = factor(class, levels = top_classes))
+
+species_presence <- area_occurrences |>
+  distinct(area, species_label) |>
+  filter(!is.na(species_label))
+
+shared_species_count <- species_presence |>
+  count(species_label, name = "area_count") |>
+  filter(area_count == 2) |>
+  nrow()
+
+unique_species <- species_presence |>
+  add_count(species_label, name = "area_count") |>
+  filter(area_count == 1) |>
+  select(area, species_label)
+
+species_union_count <- n_distinct(species_presence$species_label)
+species_total_count <- nrow(species_presence)
+
+overlap_metrics <- tibble(
+  shared_species_count = shared_species_count,
+  species_union_count = species_union_count,
+  jaccard_similarity = if (species_union_count == 0) NA_real_ else shared_species_count / species_union_count,
+  sorensen_similarity = if (species_total_count == 0) NA_real_ else 2 * shared_species_count / species_total_count
+)
+
+venn_polygons <- bind_rows(
+  tibble(
+    x = -0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
+    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
+    set = "Isalo"
+  ),
+  tibble(
+    x = 0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
+    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
+    set = "Makay"
+  )
+)
+```
+
+## Protected Areas
+
+The PA is `r comma(round(area_summary$AREA_KM2[area_summary$area == "Makay"]))` km² for Makay and `r comma(round(area_summary$AREA_KM2[area_summary$area == "Isalo"]))` km² for Isalo.
+
+```{r}
+tmap_mode("view")
+
+tm_shape(protected_areas) +
+  tm_polygons(
+    col = "area",
+    palette = area_colors,
+    alpha = 0.7,
+    border.col = "#1f1f1f",
+    lwd = 1.5,
+    id = "area"
+  ) +
+  tm_text("area")
+```
+
+```{r}
+area_summary |>
+  transmute(
+    area,
+    area_km2 = round(AREA_KM2, 1),
+    polygon_count = occurrence_count,
+    species_count,
+    occurrence_density_per_100_km2 = round(occurrence_density_per_100_km2, 1),
+    species_density_per_100_km2 = round(species_density_per_100_km2, 1),
+    first_year,
+    last_year
+  ) |>
+  knitr::kable(caption = "Protected-area size and exact-polygon GBIF summary")
+```
+
+## Madagascar GBIF and Filtering
+
+The filtering workflow starts from all present GBIF records stored in the Madagascar parquet dataset, narrows the data to the parquet partitions touched by the two protected areas, and then keeps only points within the exact WDPA polygons.
+
+```{r}
+filtering_steps |>
+  mutate(
+    share_of_madagascar = percent(share_of_madagascar, accuracy = 0.1)
+  ) |>
+  knitr::kable(caption = "Filtering pipeline from Madagascar-wide GBIF data to the final protected-area occurrences")
+```
+
+```{r}
+ggplot(area_summary, aes(x = area, y = occurrence_density_per_100_km2, fill = area)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = round(occurrence_density_per_100_km2, 1)), vjust = -0.3, size = 3.6) +
+  scale_fill_manual(values = area_colors) +
+  labs(
+    title = "Occurrence density inside each protected area",
+    x = NULL,
+    y = "Occurrences per 100 km²"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+ggplot(decade_counts, aes(x = decade, y = occurrence_count, fill = area)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ area, ncol = 1) +
+  scale_fill_manual(values = area_colors) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Occurrence history by decade",
+    x = "Decade",
+    y = "Occurrence count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Class Representation
+
+The figure below focuses on the twelve classes that contribute the most species across the two protected areas combined.
+
+```{r}
+ggplot(class_plot_data, aes(x = class, y = species_count, fill = area)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  coord_flip() +
+  facet_wrap(~ area) +
+  scale_fill_manual(values = area_colors) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Species richness by class",
+    x = NULL,
+    y = "Species count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Species Overlap
+
+```{r}
+ggplot() +
+  geom_polygon(
+    data = venn_polygons,
+    aes(x = x, y = y, group = set, fill = set),
+    color = "#1f1f1f",
+    alpha = 0.45,
+    linewidth = 0.7
+  ) +
+  annotate("text", x = -1.9, y = 0, label = comma(sum(unique_species$area == "Isalo")), size = 7) +
+  annotate("text", x = 0, y = 0, label = comma(shared_species_count), size = 7) +
+  annotate("text", x = 1.9, y = 0, label = comma(sum(unique_species$area == "Makay")), size = 7) +
+  annotate("text", x = -1.85, y = 1.85, label = "Isalo", fontface = "bold", size = 5) +
+  annotate("text", x = 1.85, y = 1.85, label = "Makay", fontface = "bold", size = 5) +
+  scale_fill_manual(values = c(Isalo = area_colors[["Isalo"]], Makay = area_colors[["Makay"]])) +
+  coord_equal() +
+  labs(
+    title = "Species overlap between the two protected areas",
+    subtitle = "Counts are based on distinct species labels after exact polygon filtering"
+  ) +
+  theme_void(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+Jaccard similarity: `r percent(overlap_metrics$jaccard_similarity[[1]], accuracy = 0.1)`

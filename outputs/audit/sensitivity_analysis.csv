@@ -1,0 +1,15 @@
+filter_id,filter_label,area,occurrences,occ_density,species_all,species_density,species_vascular
+S1,Baseline (no exclusion),Makay,7341,180.97483384816618,883,21.76825749733425,524
+S1,Baseline (no exclusion),Isalo,53115,6129.623977025594,1486,171.48867984298283,622
+S2,Excluding the largest dataset in each area,Makay,4986,122.91792965085908,808,19.919311503789437,452
+S2,Excluding the largest dataset in each area,Isalo,37474,4324.6075292301075,1445,166.757161758486,622
+S3,Excluding the three largest datasets in each area,Makay,2062,50.83368851585869,459,11.315549480494248,165
+S3,Excluding the three largest datasets in each area,Isalo,20791,2399.341280360334,1334,153.94744206631165,622
+S4,Preserved specimens only,Makay,5995,147.79241641734862,727,17.922449830761042,514
+S4,Preserved specimens only,Isalo,4955,571.821270943459,668,77.0891239132655,450
+S5,"Excluding records with coordinate uncertainty > 1,000 m (unknowns kept)",Makay,7179,176.98111050210937,856,21.10263693965812,518
+S5,"Excluding records with coordinate uncertainty > 1,000 m (unknowns kept)",Isalo,51560,5950.172498455045,1421,163.98749263585373,586
+S6,"Keeping only records with known uncertainty <= 10,000 m (unknowns excluded)",Makay,373,9.195424741229532,153,3.771849826831416,23
+S6,"Keeping only records with known uncertainty <= 10,000 m (unknowns excluded)",Isalo,3004,346.6702518494754,525,60.58651205758142,257
+S7,Excluding iNaturalist,Makay,6863,169.1908847159739,787,19.401606625596894,515
+S7,Excluding iNaturalist,Isalo,49223,5680.475967638724,1183,136.52160716975015,465

@@ -1,0 +1,10 @@
+metric,legacy_value,corrected_value
+Occurrences Isalo,49606,53115
+Occurrences Makay,6692,7341
+Legacy 'species' Isalo (coalesce method),2768,2942
+Legacy 'species' Makay (coalesce method),1274,1302
+Accepted species Isalo (speciesKey),NA,1486
+Accepted species Makay (speciesKey),NA,883
+Madagascar total records in parquet,73144444,3635415
+Records dropped by legacy CSV reader,300486,0
+Phantom rows in legacy parquet,70239134,0
