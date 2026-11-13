@@ -1,5 +1,6 @@
 ---
-title: "Makay and Isalo: a synthetic GBIF comparison"
+title: "Makay and Isalo: GBIF documentation comparison"
+subtitle: "Audited and corrected version (2026-11-13)"
 format:
   html:
     toc: true
@@ -13,11 +14,14 @@ execute:
 
 ## Setup
 
-We have downloaded the complete GBIF database from https://gbif.org, and 
-converted it to the parquet format to read only the partition of Madagascar
-that corresponds to our area of interest. We fetch the protected area polygons
-for Makay and Isalo from the World Database on Protected Areas (WDPA) using the
- `wdpar` package. 
+This document compares GBIF occurrence documentation for the Makay and Isalo
+protected areas (Madagascar). It is the corrected output of a reproducibility
+audit (2026-11-13) of an earlier version of this report; every methodological
+change is documented inline and in `audit_report.md`.
+
+The pipeline reads a GBIF occurrence download stored as a partitioned parquet
+dataset, and the World Database on Protected Areas (WDPA) polygons for the two
+sites.
 
 ```{r}
 library(arrow) # to read parquet
@@ -25,198 +29,70 @@ library(tidyverse) # for data manipulation
 library(scales) # scale conversion
 library(sf) # vector spatial data
 library(tmap) # map visualization
-library(wdpar) # to fetch protected areas
 
 # define paths
-wdpa_dir <- ("data/raw/wdpa")
-parquet_dir <- ("data/parquet/gbif_madagascar")
+wdpa_zip <- "data/raw/wdpa/WDPA_Jul2026_MDG-shapefile.zip"
+wdpa_gdb <- "data/raw/wdpa/WDPA_WDOECM_Jul2026_Public_MDG.gdb"
+parquet_dir <- "data/parquet/gbif_madagascar"
+dataset_names_path <- "outputs/gbif_dataset_names.csv"
 # keep consistent colors across document
 area_colors <- c(Makay = "#3b7a57", Isalo = "#c85c3e")
-
-# create folder if needed
-dir.create(wdpa_dir, recursive = TRUE, showWarnings = FALSE)
-# fetch WDPA
-madagascar_wdpa <- wdpa_fetch("MDG", wait = TRUE, download_dir = wdpa_dir)
-
-protected_areas <- madagascar_wdpa |>
-  rename(geometry = SHAPE) |>
-  st_as_sf(sf_column_name = "geometry") |>
-  st_make_valid() |>
-  mutate(
-    area = coalesce(NAME_ENG, NAME),
-    # Area using laborde
-    AREA_KM2 = as.numeric(st_area(st_transform(geometry, 29702))) / 1000000
-  ) |>
-  filter(str_detect(area, "Makay|Isalo")) |>
-  st_transform(4326) 
-
-# Define bounding boxes to read only gbif data within
-bbox_matrix <- t(vapply(
-  st_geometry(protected_areas),
-  \(geometry) unname(st_bbox(geometry)),
-  numeric(4)
-))
-
-colnames(bbox_matrix) <- c("xmin", "ymin", "xmax", "ymax")
-
-
-area_bboxes <- as_tibble(bbox_matrix) |>
-  mutate(
-    lon_bin_min = floor(xmin),
-    lon_bin_max = floor(xmax),
-    lat_bin_min = floor(ymin),
-    lat_bin_max = floor(ymax)
-  )
-
-lon_bins <- seq(min(area_bboxes$lon_bin_min), max(area_bboxes$lon_bin_max))
-lat_bins <- seq(min(area_bboxes$lat_bin_min), max(area_bboxes$lat_bin_max))
-
-# columns to keep from gbif
-required_columns <- c(
-  "decimalLongitude",
-  "decimalLatitude",
-  "species",
-  "scientificName",
-  "year",
-  "datasetName",
-  "datasetKey",
-  "institutionCode",
-  "publishingOrgKey",
-  "basisOfRecord",
-  "class",
-  "iucnRedListCategory",
-  "genus",
-  "family",
-  "coordinateUncertaintyInMeters",
-  "occurrenceStatus"
-)
-
-# compute total for Mada
-madagascar_total <- open_dataset(parquet_dir) |>
-  filter(is.na(occurrenceStatus) | occurrenceStatus == "PRESENT") |>
-  summarise(total_records = n()) |>
-  collect()
-
-candidate_occurrences <- open_dataset(parquet_dir) |>
-  select(any_of(c(required_columns, "lon_bin", "lat_bin"))) |>
-  filter(
-    lon_bin %in% lon_bins,
-    lat_bin %in% lat_bins,
-    !is.na(decimalLongitude),
-    !is.na(decimalLatitude),
-    is.na(occurrenceStatus) | occurrenceStatus == "PRESENT"
-  ) |>
-  collect()
-
-for (column_name in setdiff(required_columns, names(candidate_occurrences))) {
-  candidate_occurrences[[column_name]] <- NA
-}
-
-area_occurrences <- candidate_occurrences |>
-  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326, remove = FALSE) |>
-  st_join(protected_areas |> select(area), join = st_within, left = FALSE) |>
-  st_drop_geometry() |>
-  mutate(
-    species_label = coalesce(species, scientificName),
-    record_year = suppressWarnings(as.integer(year))
-  )
-
-area_summary <- protected_areas |>
-  st_drop_geometry() |>
-  left_join(
-    area_occurrences |>
-      summarise(
-        occurrence_count = n(),
-        species_count = n_distinct(species_label, na.rm = TRUE),
-        first_year = if (all(is.na(record_year))) NA_integer_ else min(record_year, na.rm = TRUE),
-        last_year = if (all(is.na(record_year))) NA_integer_ else max(record_year, na.rm = TRUE),
-        .by = area
-      ),
-    by = "area"
-  ) |>
-  mutate(
-    occurrence_count = coalesce(occurrence_count, 0L),
-    species_count = coalesce(species_count, 0L),
-    occurrence_density_per_100_km2 = occurrence_count / AREA_KM2 * 100,
-    species_density_per_100_km2 = species_count / AREA_KM2 * 100
-  )
-
-filtering_steps <- tibble(
-  step = c(
-    "Madagascar present records",
-    "Records inside the exact protected-area polygons"
-  ),
-  record_count = c(
-    madagascar_total$total_records[[1]],
-    nrow(area_occurrences)
-  )
-) |>
-  mutate(
-    share_of_madagascar = record_count / first(record_count)
-  )
-
-decade_counts <- area_occurrences |>
-  filter(!is.na(record_year), between(record_year, 1800, as.integer(format(Sys.Date(), "%Y")))) |>
-  mutate(decade = (record_year %/% 10) * 10) |>
-  summarise(occurrence_count = n(), .by = c(area, decade))
-
-class_comparison <- area_occurrences |>
-  distinct(area, class, species_label) |>
-  filter(!is.na(class), !is.na(species_label)) |>
-  count(area, class, name = "species_count")
-
-top_classes <- class_comparison |>
-  summarise(total_species = sum(species_count), .by = class) |>
-  slice_max(total_species, n = 12, with_ties = FALSE) |>
-  arrange(total_species) |>
-  pull(class)
-
-class_plot_data <- class_comparison |>
-  filter(class %in% top_classes) |>
-  complete(area, class = top_classes, fill = list(species_count = 0)) |>
-  mutate(class = factor(class, levels = top_classes))
-
-species_presence <- area_occurrences |>
-  distinct(area, species_label) |>
-  filter(!is.na(species_label))
-
-shared_species_count <- species_presence |>
-  count(species_label, name = "area_count") |>
-  filter(area_count == 2) |>
-  nrow()
-
-unique_species <- species_presence |>
-  add_count(species_label, name = "area_count") |>
-  filter(area_count == 1) |>
-  select(area, species_label)
-
-species_union_count <- n_distinct(species_presence$species_label)
-species_total_count <- nrow(species_presence)
-
-overlap_metrics <- tibble(
-  shared_species_count = shared_species_count,
-  species_union_count = species_union_count,
-  jaccard_similarity = if (species_union_count == 0) NA_real_ else shared_species_count / species_union_count,
-  sorensen_similarity = if (species_total_count == 0) NA_real_ else 2 * shared_species_count / species_total_count
-)
-
-venn_polygons <- bind_rows(
-  tibble(
-    x = -0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
-    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
-    set = "Isalo"
-  ),
-  tibble(
-    x = 0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
-    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
-    set = "Makay"
-  )
-)
 ```
 
-## Protected Areas
+## Provenance
 
-The PA is `r comma(round(area_summary$AREA_KM2[area_summary$area == "Makay"]))` km² for Makay and `r comma(round(area_summary$AREA_KM2[area_summary$area == "Isalo"]))` km² for Isalo.
+All occurrence data come from a single GBIF occurrence download:
+
+- **Download key**: `0000459-260720095953322`; **DOI**: [10.15468/dl.ufwdju](https://doi.org/10.15468/dl.ufwdju)
+- **Created** 2026-07-20 19:51 UTC, completed 22:53 UTC; format `SIMPLE_CSV` (50 columns)
+- **Predicate**: `occurrenceStatus = PRESENT` AND `country = MG` (Madagascar)
+- **3,635,415 records** from 2,006 datasets, licensed **CC BY-NC 4.0**
+- Converted to a lon/lat-partitioned parquet dataset by
+  `R/convert_gbif_madagascar_to_parquet.R`. The audit found and fixed two
+  conversion defects in the superseded converter (see *Audit notes* at the end
+  of this document): silently dropped records caused by malformed quoting in
+  the source CSV (262 records with stray unescaped `"` characters caused
+  readr's chunked reader to lose ~300,486 records), and 70,239,134 all-NA
+  "phantom" rows created by `NA`-propagating logical subsetting. The corrected
+  dataset contains exactly 3,635,415 records (verified against the GBIF API)
+  and all 50 source columns, including `kingdom`, `phylum`, `taxonRank`,
+  `taxonKey` and `speciesKey`.
+
+Protected-area boundaries come from the **WDPA/WDOECM July 2026 public
+release** (`WDPA_Jul2026_MDG-shapefile.zip`, MD5
+`d96a919e7ce1ed8389c9da863f692d8d`, internal file dates 2026-07-16). The
+cached archive is read directly with GDAL's OpenFileGDB driver. (The
+`wdpar::wdpa_fetch()` download-page scraping used previously no longer works;
+`wdpa_read()` performed no geometry processing beyond unzipping, so reading
+the geodatabase directly reproduces the same polygons.)
+
+```{r}
+# extract the geodatabase from the cached WDPA zip if needed
+if (!dir.exists(wdpa_gdb)) {
+  utils::unzip(wdpa_zip, exdir = dirname(wdpa_zip))
+}
+
+protected_areas <- st_read(wdpa_gdb, layer = "WDPA_WDOECM_poly_Jul2026_MDG", quiet = TRUE) |>
+  mutate(area = coalesce(NAME_ENG, NAME)) |>
+  filter(str_detect(area, regex("makay|isalo", ignore_case = TRUE))) |>
+  st_make_valid() |>
+  rename(geometry = SHAPE) |>
+  select(area, SITE_ID, DESIG_ENG, IUCN_CAT, STATUS, STATUS_YR, REP_AREA, GIS_AREA, geometry) |>
+  # Area on the ellipsoidal equal-area projection EPSG:6933; this reproduces
+  # WDPA's own GIS_AREA column exactly. The earlier report used EPSG:29702
+  # (Laborde, conformal: 4,052 / 866 km²) and an earlier script used geodesic
+  # area on the WGS84 ellipsoid (4,067 / 869 km²); see audit notes.
+  mutate(AREA_KM2 = as.numeric(st_area(st_transform(geometry, 6933))) / 1000000) |>
+  st_transform(4326)
+```
+
+## Protected areas
+
+Both polygons are WDPA site polygons, not geomorphological outlines of the
+massifs: Isalo (WDPA site 2312) is a national park (IUCN category II,
+designated 1962); Makay (WDPA site 555790177) is a proposed protected area
+("Aire Protégée", status Proposed, 2015). The two polygons do not overlap and
+there is exactly one polygon per site.
 
 ```{r}
 tmap_mode("view")
@@ -233,37 +109,204 @@ tm_shape(protected_areas) +
   tm_text("area")
 ```
 
+## Madagascar GBIF and filtering
+
+The filtering workflow starts from all 3,635,415 PRESENT records of the GBIF
+Madagascar download, narrows the data to the parquet partitions touched by the
+two protected areas (a prefilter to avoid loading the full extract), keeps
+records inside the rectangular bounding box of each area, and finally keeps
+only points within the exact WDPA polygons (`st_within`, so the polygons
+themselves — not their bounding boxes — define the study areas).
+
 ```{r}
-area_summary |>
-  transmute(
-    area,
-    area_km2 = round(AREA_KM2, 1),
-    polygon_count = occurrence_count,
-    species_count,
-    occurrence_density_per_100_km2 = round(occurrence_density_per_100_km2, 1),
-    species_density_per_100_km2 = round(species_density_per_100_km2, 1),
-    first_year,
-    last_year
+# columns used in this document
+required_columns <- c(
+  "gbifID", "decimalLongitude", "decimalLatitude", "species", "scientificName",
+  "year", "datasetKey", "basisOfRecord", "kingdom", "phylum", "class",
+  "taxonRank", "speciesKey", "genus", "family",
+  "coordinateUncertaintyInMeters", "occurrenceStatus"
+)
+
+# per-area bounding boxes (computed per feature, then floored to 1-degree bins)
+bbox_matrix <- t(vapply(
+  st_geometry(protected_areas),
+  \(geometry) unname(st_bbox(geometry)),
+  numeric(4)
+))
+colnames(bbox_matrix) <- c("xmin", "ymin", "xmax", "ymax")
+area_bboxes <- as_tibble(bbox_matrix) |>
+  mutate(area = protected_areas$area)
+
+candidate_occurrences <- open_dataset(parquet_dir) |>
+  select(any_of(c(required_columns, "lon_bin", "lat_bin"))) |>
+  filter(
+    lon_bin %in% 44:45,
+    lat_bin %in% -23:-21,
+    !is.na(decimalLongitude),
+    !is.na(decimalLatitude),
+    is.na(occurrenceStatus) | occurrenceStatus == "PRESENT"
   ) |>
-  knitr::kable(caption = "Protected-area size and exact-polygon GBIF summary")
+  collect()
+
+bbox_counts <- candidate_occurrences |>
+  mutate(
+    in_isalo = decimalLongitude >= area_bboxes$xmin[area_bboxes$area == "Isalo"] &
+      decimalLongitude <= area_bboxes$xmax[area_bboxes$area == "Isalo"] &
+      decimalLatitude >= area_bboxes$ymin[area_bboxes$area == "Isalo"] &
+      decimalLatitude <= area_bboxes$ymax[area_bboxes$area == "Isalo"],
+    in_makay = decimalLongitude >= area_bboxes$xmin[area_bboxes$area == "Makay"] &
+      decimalLongitude <= area_bboxes$xmax[area_bboxes$area == "Makay"] &
+      decimalLatitude >= area_bboxes$ymin[area_bboxes$area == "Makay"] &
+      decimalLatitude <= area_bboxes$ymax[area_bboxes$area == "Makay"]
+  ) |>
+  summarise(Isalo = sum(in_isalo), Makay = sum(in_makay)) |>
+  pivot_longer(everything(), names_to = "area", values_to = "record_count") |>
+  mutate(step = "Inside bounding box")
+
+area_occurrences <- candidate_occurrences |>
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326, remove = FALSE) |>
+  st_join(protected_areas |> select(area), join = st_within, left = FALSE) |>
+  st_drop_geometry() |>
+  mutate(record_year = suppressWarnings(as.integer(year)))
+
+filtering_steps <- tibble(
+  step = c(
+    "GBIF Madagascar download (PRESENT records, verified against the GBIF API)",
+    "Candidate records read from parquet bins (with coordinates)",
+    "Inside bounding box",
+    "Clipped to exact WDPA polygon (st_within)"
+  ),
+  record_count = c(
+    3635415L,
+    nrow(candidate_occurrences),
+    sum(bbox_counts$record_count),
+    nrow(area_occurrences)
+  )
+) |>
+  mutate(share_of_madagascar = record_count / first(record_count))
 ```
-
-## Madagascar GBIF and Filtering
-
-The filtering workflow starts from all present GBIF records stored in the Madagascar parquet dataset, narrows the data to the parquet partitions touched by the two protected areas, and then keeps only points within the exact WDPA polygons.
 
 ```{r}
 filtering_steps |>
   mutate(
-    share_of_madagascar = percent(share_of_madagascar, accuracy = 0.1)
+    across(record_count, comma),
+    share_of_madagascar = percent(share_of_madagascar, accuracy = 0.01)
   ) |>
-  knitr::kable(caption = "Filtering pipeline from Madagascar-wide GBIF data to the final protected-area occurrences")
+  knitr::kable(caption = "Filtering pipeline from the GBIF Madagascar download to the polygon-clipped occurrences")
+```
+
+The bbox stage removes most of the Madagascar archive before loading to
+memory, and the polygon stage then removes additional records that fall inside
+the rectangular extent but outside the protected-area boundary.
+
+## Species definition (audit correction)
+
+The earlier report counted "species" as
+`species_label = coalesce(species, scientificName)`. This construction counts
+**identifications of any rank** as species: when GBIF's `species` field is
+empty (genus-, family- or order-level identifications, and unmatched names),
+the fallback `scientificName` contributes labels such as *Diptera*,
+*Chironomidae* or *Grewia* (with or without authorship) that are not species.
+In the earlier data the top "species" of Isalo by record count were *Diptera*
+(2,071), *Coleoptera* (1,941) and *Chironomidae* (1,859) — all higher-rank
+labels.
+
+This document counts **accepted species** with the GBIF backbone identifier
+`speciesKey`, which is populated only for identifications at or below species
+rank and resolves synonyms to the accepted species. Two properties were
+verified in the data: (i) no record with a species-rank identification lacks a
+`speciesKey` (none are lost by this definition), and (ii) `speciesKey` and
+`species` agree except for six name strings shared by two homotypic backbone
+keys, so keys are used throughout. Records identified only above species rank
+(66% of Isalo occurrences, largely bulk arthropod samples identified to
+family/order; 33% of Makay occurrences, largely genus-level plant
+determinations) are retained in occurrence counts but contribute to no species
+count; they are reported separately as higher-rank identifications.
+
+```{r}
+higher_rank_labels <- area_occurrences |>
+  filter(is.na(speciesKey), !is.na(scientificName)) |>
+  count(area, scientificName, sort = TRUE) |>
+  group_by(area) |>
+  slice_head(n = 8) |>
+  ungroup() |>
+  rename(higher_rank_label = scientificName)
+
+rank_breakdown <- area_occurrences |>
+  filter(is.na(speciesKey)) |>
+  count(area, taxonRank) |>
+  pivot_wider(names_from = area, values_from = n, values_fill = 0) |>
+  arrange(desc(Isalo))
 ```
 
 ```{r}
-ggplot(area_summary, aes(x = area, y = occurrence_density_per_100_km2, fill = area)) +
+rank_breakdown |>
+  mutate(across(Isalo:Makay, comma)) |>
+  knitr::kable(caption = "Records without an accepted-species identifier, by identification rank")
+```
+
+```{r}
+higher_rank_labels |>
+  mutate(across(n, comma)) |>
+  knitr::kable(caption = "Most frequent higher-rank identification labels (not counted as species)")
+```
+
+## Taxonomic scope comparison
+
+The manuscript focuses on plants, so the comparison is reported for three
+nested scopes: all taxa, Plantae (as assigned by the GBIF backbone — including
+bryophytes and algae classified in Plantae), and vascular plants (phylum
+Tracheophyta).
+
+```{r}
+scope_comparison <- bind_rows(
+  area_occurrences |> mutate(scope_name = "All taxa"),
+  area_occurrences |> filter(kingdom == "Plantae") |>
+    mutate(scope_name = "Plantae (GBIF backbone)"),
+  area_occurrences |> filter(kingdom == "Plantae", phylum == "Tracheophyta") |>
+    mutate(scope_name = "Vascular plants (Tracheophyta)")
+) |>
+  summarise(
+    occurrences = n(),
+    accepted_species = n_distinct(speciesKey[!is.na(speciesKey)]),
+    higher_rank_only_records = sum(is.na(speciesKey)),
+    .by = c(scope_name, area)
+  ) |>
+  left_join(protected_areas |> st_drop_geometry() |> select(area, AREA_KM2), by = "area") |>
+  mutate(
+    occurrence_density_per_100_km2 = occurrences / AREA_KM2 * 100,
+    species_density_per_100_km2 = accepted_species / AREA_KM2 * 100
+  )
+```
+
+```{r}
+scope_comparison |>
+  transmute(
+    scope_name,
+    area,
+    area_km2 = round(AREA_KM2, 1),
+    occurrences = comma(occurrences),
+    accepted_species = comma(accepted_species),
+    higher_rank_only_records = comma(higher_rank_only_records),
+    occ_per_100_km2 = round(occurrence_density_per_100_km2, 1),
+    species_per_100_km2 = round(species_density_per_100_km2, 1)
+  ) |>
+  knitr::kable(caption = "GBIF documentation by taxonomic scope (accepted species based on GBIF backbone speciesKey)")
+```
+
+For plants the raw contrast is much smaller than for all taxa: Isalo holds
+`r comma(scope_comparison$accepted_species[scope_comparison$scope_name == "Vascular plants (Tracheophyta)" & scope_comparison$area == "Isalo"])`
+vascular plant species against
+`r comma(scope_comparison$accepted_species[scope_comparison$scope_name == "Vascular plants (Tracheophyta)" & scope_comparison$area == "Makay"])`
+for Makay, whereas Isalo holds almost twice as many accepted species across
+all taxa. The all-taxon asymmetry is largely produced by Isalo's bulk
+arthropod and molecular sampling campaigns (see *Sampling profile*).
+
+```{r}
+ggplot(scope_comparison, aes(x = area, y = occurrence_density_per_100_km2, fill = area)) +
   geom_col(width = 0.65, show.legend = FALSE) +
   geom_text(aes(label = round(occurrence_density_per_100_km2, 1)), vjust = -0.3, size = 3.6) +
+  facet_wrap(~ scope_name, scales = "free_y") +
   scale_fill_manual(values = area_colors) +
   labs(
     title = "Occurrence density inside each protected area",
@@ -274,6 +317,11 @@ ggplot(area_summary, aes(x = area, y = occurrence_density_per_100_km2, fill = ar
 ```
 
 ```{r}
+decade_counts <- area_occurrences |>
+  filter(!is.na(record_year), between(record_year, 1800, as.integer(format(Sys.Date(), "%Y")))) |>
+  mutate(decade = (record_year %/% 10) * 10) |>
+  summarise(occurrence_count = n(), .by = c(area, decade))
+
 ggplot(decade_counts, aes(x = decade, y = occurrence_count, fill = area)) +
   geom_col(show.legend = FALSE) +
   facet_wrap(~ area, ncol = 1) +
@@ -288,28 +336,133 @@ ggplot(decade_counts, aes(x = decade, y = occurrence_count, fill = area)) +
   theme_minimal(base_size = 12)
 ```
 
-## Class Representation
+## Sampling profile
 
-The figure below focuses on the twelve classes that contribute the most species across the two protected areas combined.
+The two areas document different kinds of evidence. Isalo's record set is
+dominated by molecular and bulk material samples, Makay's by herbarium and
+insect specimens.
 
 ```{r}
-ggplot(class_plot_data, aes(x = class, y = species_count, fill = area)) +
-  geom_col(show.legend = FALSE, width = 0.7) +
-  coord_flip() +
-  facet_wrap(~ area) +
-  scale_fill_manual(values = area_colors) +
-  scale_y_continuous(labels = comma) +
-  labs(
-    title = "Species richness by class",
-    x = NULL,
-    y = "Species count"
-  ) +
-  theme_minimal(base_size = 12)
+basis_comparison <- area_occurrences |>
+  count(area, basisOfRecord, name = "occurrence_count") |>
+  mutate(share = occurrence_count / sum(occurrence_count), .by = area) |>
+  arrange(area, desc(occurrence_count))
+
+basis_comparison |>
+  transmute(area, basisOfRecord, occurrences = comma(occurrence_count), share = percent(share, accuracy = 0.1)) |>
+  knitr::kable(caption = "Basis of record composition")
 ```
 
-## Species Overlap
+```{r}
+# dataset contributions, with titles fetched from the GBIF dataset API
+# (outputs/gbif_dataset_names.csv, fetched 2026-11-13)
+dataset_names <- if (file.exists(dataset_names_path)) read_csv(dataset_names_path, show_col_types = FALSE) else NULL
+
+dataset_stats <- area_occurrences |>
+  count(area, datasetKey, name = "occurrences") |>
+  mutate(share = occurrences / sum(occurrences), .by = area) |>
+  arrange(area, desc(occurrences))
+
+top_datasets <- dataset_stats |>
+  group_by(area) |>
+  slice_head(n = 5) |>
+  ungroup() |>
+  left_join(dataset_names, by = "datasetKey") |>
+  mutate(dataset_title = coalesce(dataset_title, datasetKey))
+
+top_datasets |>
+  transmute(area, dataset = dataset_title, occurrences = comma(occurrences), share = percent(share, accuracy = 0.1)) |>
+  knitr::kable(caption = "Five largest contributing datasets per area")
+```
+
+Isalo's material-sample mass comes from the International Barcode of Life
+project (29% of all Isalo records), CO1 amplicon sequence variants of bulk
+arthropod samples (16%) and the Global soil organisms dataset (15%); eBird
+checklists add another 16%. Makay's records are dominated by Missouri
+Botanical Garden herbarium specimens (Tropicos: 45% of all Makay records) and
+AntWeb (26%). Within vascular plants, ~90% of Makay's GBIF plant records are
+Tropicos herbarium specimens, while Isalo's plant records are more mixed
+(iNaturalist 34%, Tropicos 29%, MNHN herbarium 13%).
+
+Records are also strongly concentrated in space: **four distinct coordinate
+pairs hold 50% of all Isalo occurrences** (the most frequent pair holds 23%),
+consistent with bulk samples georeferenced to site or park centroids, whereas
+Makay's records are far less repeated (top pair 3%; 43 distinct coordinates
+needed to reach 50%). Occurrence densities therefore partly reflect
+georeferencing practice rather than sampling intensity alone.
+
+## Species overlap
 
 ```{r}
+species_presence <- area_occurrences |>
+  filter(!is.na(speciesKey)) |>
+  distinct(area, speciesKey)
+
+shared_species_count <- species_presence |> count(speciesKey) |> filter(n == 2) |> nrow()
+unique_species <- species_presence |>
+  add_count(speciesKey, name = "area_count") |>
+  filter(area_count == 1) |>
+  select(area, speciesKey)
+species_union_count <- n_distinct(species_presence$speciesKey)
+species_total_count <- nrow(species_presence)
+
+overlap_metrics <- tibble(
+  shared_species_count = shared_species_count,
+  species_union_count = species_union_count,
+  jaccard_similarity = shared_species_count / species_union_count,
+  sorensen_similarity = 2 * shared_species_count / species_total_count
+)
+
+scope_presence_list <- list(
+  "All taxa" = species_presence,
+  "Plantae (GBIF backbone)" = area_occurrences |>
+    filter(kingdom == "Plantae", !is.na(speciesKey)) |>
+    distinct(area, speciesKey),
+  "Vascular plants (Tracheophyta)" = area_occurrences |>
+    filter(kingdom == "Plantae", phylum == "Tracheophyta", !is.na(speciesKey)) |>
+    distinct(area, speciesKey)
+)
+
+scope_overlap <- imap_dfr(scope_presence_list, \(presence, scope_name) {
+  per_key <- count(presence, speciesKey)
+  per_area <- count(presence, area, name = "sp")
+  isalo_species <- per_area$sp[per_area$area == "Isalo"]
+  makay_species <- per_area$sp[per_area$area == "Makay"]
+  shared <- sum(per_key$n == 2)
+  union <- nrow(per_key)
+  tibble(
+    scope_name,
+    isalo_species,
+    makay_species,
+    shared,
+    union,
+    jaccard = shared / union,
+    sorensen = 2 * shared / (isalo_species + makay_species)
+  )
+})
+```
+
+```{r}
+scope_overlap |>
+  mutate(across(c(isalo_species, makay_species, shared, union), comma)) |>
+  mutate(across(c(jaccard, sorensen), \(x) percent(x, accuracy = 0.1))) |>
+  knitr::kable(caption = "Recorded-species overlap between areas, by taxonomic scope (accepted species)")
+```
+
+```{r}
+venn_polygons <- bind_rows(
+  tibble(
+    x = -0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
+    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
+    set = "Isalo"
+  ),
+  tibble(
+    x = 0.8 + 1.6 * cos(seq(0, 2 * pi, length.out = 360)),
+    y = 1.6 * sin(seq(0, 2 * pi, length.out = 360)),
+    set = "Makay"
+  )
+)
+
 ggplot() +
   geom_polygon(
     data = venn_polygons,
@@ -326,11 +479,157 @@ ggplot() +
   scale_fill_manual(values = c(Isalo = area_colors[["Isalo"]], Makay = area_colors[["Makay"]])) +
   coord_equal() +
   labs(
-    title = "Species overlap between the two protected areas",
-    subtitle = "Counts are based on distinct species labels after exact polygon filtering"
+    title = "Accepted-species overlap between the two protected areas",
+    subtitle = "Counts based on GBIF backbone speciesKey after exact polygon filtering (all taxa)"
   ) +
   theme_void(base_size = 12) +
   theme(legend.position = "none")
 ```
 
-Jaccard similarity: `r percent(overlap_metrics$jaccard_similarity[[1]], accuracy = 0.1)`
+Jaccard similarity (all taxa): `r percent(overlap_metrics$jaccard_similarity[[1]], accuracy = 0.1)`.
+
+## Class representation
+
+The figure shows the twelve classes contributing the most accepted species
+across the two areas combined.
+
+```{r}
+class_comparison <- area_occurrences |>
+  filter(!is.na(speciesKey), !is.na(class)) |>
+  distinct(area, class, speciesKey) |>
+  count(area, class, name = "species_count")
+
+top_classes <- class_comparison |>
+  summarise(total_species = sum(species_count), .by = class) |>
+  slice_max(total_species, n = 12, with_ties = FALSE) |>
+  arrange(total_species) |>
+  pull(class)
+
+class_plot_data <- class_comparison |>
+  filter(class %in% top_classes) |>
+  complete(area, class = top_classes, fill = list(species_count = 0)) |>
+  mutate(class = factor(class, levels = top_classes))
+
+ggplot(class_plot_data, aes(x = species_count, y = class, fill = area)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  facet_wrap(~ area) +
+  scale_fill_manual(values = area_colors) +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title = "Accepted species richness by class",
+    x = "Species count",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Sensitivity analysis
+
+The robustness of the main contrast was tested by recomputing counts under
+alternative record filters: excluding the largest dataset(s) of each area,
+restricting to preserved specimens, and filtering on coordinate uncertainty
+(available for only ~7% of records in both areas).
+
+```{r}
+top_dataset_by_area <- dataset_stats |> group_by(area) |> slice_head(n = 1) |> ungroup()
+top3_by_area <- dataset_stats |> group_by(area) |> slice_head(n = 3) |> ungroup()
+
+sensitivity_filters <- list(
+  list(id = "S1", label = "Baseline (no exclusion)", f = function(d) d),
+  list(id = "S2", label = "Excluding largest dataset per area", f = function(d)
+    d |> anti_join(top_dataset_by_area |> select(area, datasetKey), by = c("area", "datasetKey"))),
+  list(id = "S3", label = "Excluding three largest datasets per area", f = function(d)
+    d |> anti_join(top3_by_area |> select(area, datasetKey), by = c("area", "datasetKey"))),
+  list(id = "S4", label = "Preserved specimens only", f = function(d)
+    d |> filter(basisOfRecord == "PRESERVED_SPECIMEN")),
+  list(id = "S5", label = "Excluding uncertainty > 1,000 m (unknowns kept)", f = function(d)
+    d |> filter(is.na(coordinateUncertaintyInMeters) | coordinateUncertaintyInMeters <= 1000)),
+  list(id = "S6", label = "Known uncertainty <= 10,000 m only (unknowns excluded)", f = function(d)
+    d |> filter(!is.na(coordinateUncertaintyInMeters), coordinateUncertaintyInMeters <= 10000)),
+  list(id = "S7", label = "Excluding iNaturalist", f = function(d)
+    d |> filter(datasetKey != "50c9509d-22c7-4a22-a47d-8c48425ef4a7"))
+)
+
+sensitivity_results <- map_dfr(sensitivity_filters, \(fltr) {
+  fltr$f(area_occurrences) |>
+    summarise(
+      occurrences = n(),
+      species_all = n_distinct(speciesKey[!is.na(speciesKey)]),
+      species_vascular = n_distinct(speciesKey[!is.na(speciesKey) & kingdom == "Plantae" & phylum == "Tracheophyta"]),
+      .by = area
+    ) |>
+    mutate(filter_id = fltr$id, filter_label = fltr$label)
+}) |>
+  left_join(protected_areas |> st_drop_geometry() |> select(area, AREA_KM2), by = "area") |>
+  mutate(
+    occ_density = occurrences / AREA_KM2 * 100,
+    species_density = species_all / AREA_KM2 * 100
+  )
+
+sensitivity_wide <- sensitivity_results |>
+  select(-AREA_KM2) |>
+  pivot_wider(names_from = area, values_from = c(occurrences, occ_density, species_all, species_density, species_vascular)) |>
+  mutate(
+    occ_density_ratio = occ_density_Isalo / occ_density_Makay,
+    species_density_ratio = species_density_Isalo / species_density_Makay,
+    raw_species_ratio = species_all_Isalo / species_all_Makay,
+    vascular_species_ratio = species_vascular_Isalo / species_vascular_Makay
+  )
+```
+
+```{r}
+sensitivity_wide |>
+  transmute(
+    filter_id,
+    filter_label,
+    `Isalo occ.` = comma(occurrences_Isalo),
+    `Makay occ.` = comma(occurrences_Makay),
+    `Isalo sp.` = comma(species_all_Isalo),
+    `Makay sp.` = comma(species_all_Makay),
+    `Vasc. sp. Isalo` = comma(species_vascular_Isalo),
+    `Vasc. sp. Makay` = comma(species_vascular_Makay),
+    `Occ. density ratio` = round(occ_density_ratio, 1),
+    `Sp. density ratio` = round(species_density_ratio, 1)
+  ) |>
+  knitr::kable(caption = "Sensitivity of the Makay/Isalo contrast to alternative record filters")
+```
+
+The occurrence-density contrast (Isalo/Makay) remains between ~34× and ~47×
+under every filter, and the species-density contrast between ~4× and ~16×:
+the conclusion that GBIF documentation is heavily unequal is robust. Two
+results qualify it: (i) restricted to **preserved specimens**, Makay holds
+more occurrences (5,995 vs 4,955) and more species (727 vs 668) than Isalo —
+the asymmetry is specific to recent molecular bulk-sampling and checklist
+campaigns; and (ii) excluding Makay's dominant datasets hits Makay harder
+(72% of its records sit in its top three datasets, vs 61% in Isalo).
+
+## Audit notes
+
+Differences from the earlier version of this report:
+
+1. **Species counting.** The `coalesce(species, scientificName)` label method
+   counted higher-rank identifications as species; accepted species are now
+   counted with `speciesKey`. The earlier headline counts (2,768 Isalo /
+   1,274 Makay) mix species with family-, order- and genus-level labels.
+2. **Parquet conversion defects.** The superseded converter (a) silently
+   dropped 300,486 of 3,635,415 records because 262 malformed-quote records
+   desynchronised readr's chunked reader, and (b) created 70,239,134 all-NA
+   phantom rows via `NA`-propagating logical subsetting. The earlier
+   "Madagascar present records = 73,144,444" figure was the sum of real and
+   phantom rows; the correct figure is 3,635,415. Area-level results used
+   only records with coordinates, so earlier occurrence counts were valid but
+   undercounted (Isalo 49,606 → 53,115; Makay 6,692 → 7,341).
+3. **Area computation.** Areas are now computed in the ellipsoidal equal-area
+   projection EPSG:6933, reproducing WDPA's own `GIS_AREA` (866.5 km² Isalo,
+   4,056.4 km² Makay). Earlier figures used EPSG:29702 (Laborde: 865.7 /
+   4,052.4) or geodesic area on WGS84 (868.7 / 4,067.5); all three are within
+   ~0.5% of one another.
+4. **Unreproducible legacy figures.** The companion interpretation note
+   reported 2,749 species for Isalo and 1,293 for Makay. These values could
+   not be reproduced from any preserved artifact (RDS, CSV outputs, or this
+   report's code) and are inconsistent with all of them (which agree on
+   2,768/1,274 for the legacy method); they are superseded and should not be
+   cited.
+5. **IUCN red-list categories** are absent from the SIMPLE_CSV download
+   format; the earlier report's IUCN table was uninformative for that reason
+   and is not reproduced here.
